@@ -14,9 +14,16 @@ matrix:
   fast_finish: false
 
 # https://www.appveyor.com/docs/build-environment/#build-worker-images
-image: Visual Studio 2019
+image: Visual Studio 2022
 
 environment:
+  # Disable the .NET logo in the console output.
+  DOTNET_NOLOGO: true
+  # Disable the .NET first time experience to skip caching NuGet packages and speed up the build.
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  # Use latest version of current used .NET version.  6.0 could use the latest of 6.0.  See .\Scripts\Update-DotnetVersion.ps1
+  GE_USE_LATEST_DOTNET: true
+
   # The following entries define the default values of the environment variables.
   # They can be overridden in AppVeyor | Settings | Environment.
   GE_TEST_SLEEP_SECONDS_ON_HANG: 0
@@ -33,6 +40,10 @@ environment:
 init:
   - ps: iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
 
+cache:
+  # preserve "GitExtensions.PluginManager" directory, will be reset if appveyor.yml is modified
+  - .\artifacts\publish\GitExtensions.PluginManager -> appveyor.yml
+
 # Build settings, not to be confused with "before_build" and "after_build".
 # "project" is relative to the original build directory and not influenced by directory changes in "before_build".
 build:
@@ -44,44 +55,59 @@ build:
 install:
 - cmd: echo %APPVEYOR_REPO_COMMIT%
 - cmd: echo %APPVEYOR_PULL_REQUEST_HEAD_COMMIT%
+- ps: |
+      if($env:GE_USE_LATEST_DOTNET -eq $true)
+      {
+        .\scripts\Update-DotnetVersion.ps1
+      }
+- ps: |
+      Invoke-WebRequest "https://dot.net/v1/dotnet-install.ps1" -OutFile "./dotnet-install.ps1"
+      ./dotnet-install.ps1 -JsonFile global.json -InstallDir 'C:\Program Files\dotnet'
 - cmd: git submodule update --init --recursive
 - cmd: echo /logger:"%ProgramFiles%\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll">> Directory.Build.rsp
 - cmd: |-
     cd scripts
     C:\\Python35\\python set_version_to.py -v %APPVEYOR_BUILD_VERSION% -t %APPVEYOR_BUILD_VERSION%
     cd ..
+    git --version
 
 
 # to run your custom scripts instead of automatic MSBuild
 build_script:
 - ps: |
-    # for release branches mark the repo as clean
-    if (!$env:APPVEYOR_PULL_REQUEST_TITLE -and $env:APPVEYOR_REPO_BRANCH.StartsWith("release/")) {
-      & .\scripts\Mark-RepoClean.ps1
-    }
-
+    $isBuildingPR = $false;
     # if building a temporary merge with master, soft reset to the PR commit so the build contains the PR's hash instead of the merge-commit's hash
     if ($env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT -and ($env:APPVEYOR_REPO_COMMIT -ne $env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT))
     {
-      git reset --soft "$env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT" --
+        git reset --soft "$env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT" --
+        $isBuildingPR = $true;
     }
-
-    # build
-    & .\cibuild.cmd -restore -build -buildNative -logFileName build.binlog
+- ps: |
+    # build VC++
+    dotnet build .\scripts\native.proj -c Release --verbosity q --nologo /bl:.\artifacts\log\native.binlog
     if ($LastExitCode -ne 0) { $host.SetShouldExit($LastExitCode) }
-
-    # if we have reset above we need to reset English xlfs, otherwise the loc verification step will fail
+- ps: |
+    # build .NET
+    dotnet build -c Release --verbosity q --nologo /bl:.\artifacts\log\build.binlog /p:ContinuousIntegrationBuild=true
+    if ($LastExitCode -ne 0) { $host.SetShouldExit($LastExitCode) }
+- ps: |
+    # if we have reset above, we need to restore the merge commit, otherwise the loc verification step will fail
+    # there is no need to have the same commit hash, but there must be no pending changes before the loc verification
     # refer to https://github.com/gitextensions/gitextensions/issues/7979
-    if ($env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT) {
-      git reset $env:APPVEYOR_PULL_REQUEST_HEAD_COMMIT --quiet -- "GitUI/Translation/English.xlf" "GitUI/Translation/English.Plugins.xlf"
-      git checkout                                     --force -- "GitUI/Translation/English.xlf" "GitUI/Translation/English.Plugins.xlf"
+    if ($isBuildingPR) {
+        git config user.email "gitextensions@github.com"
+        git config user.name "Git Extensions"
+        git -c core.autocrlf=false commit -a -m "restore merge commit" 2>&1
+        # ignore warning about line-endings conversion
+        $global:LASTEXITCODE = 0
     }
-
+- ps: |
+    # Verify that new strings (if any) have been processed and ready for localisation
     # it would be nice to run '.\cibuild.cmd -loc -logFileName localise.binlog /p:NoBuild=true' but it doesn't work without `-build` switch :\
     Push-Location .\GitExtensions
-    msbuild /p:Configuration=Release /t:_UpdateEnglishTranslations /p:RunTranslationApp=true /p:ContinuousIntegrationBuild=true /v:m /bl:..\artifacts\log\localise.binlog
-    if ($LastExitCode -ne 0) { $host.SetShouldExit($LastExitCode) }
+    dotnet msbuild /p:Configuration=Release /t:_UpdateEnglishTranslations /p:RunTranslationApp=true /p:ContinuousIntegrationBuild=true /v:m /bl:..\artifacts\log\localise.binlog
     Pop-Location
+    if ($LastExitCode -ne 0) { $host.SetShouldExit($LastExitCode) }
 
 
 # to run your custom scripts instead of automatic tests
@@ -106,8 +132,8 @@ test_script:
         Write-Host ""
         Write-Host "[INFO]: Test Run ${testRun}/${testRunCount}${failedBefore}"
 
-        if ($runUnitTests        -ne 0) { & .\cibuild.cmd /p:NoBuild=true -test            -logFileName UnitTest.binlog        }
-        if ($runIntegrationTests -ne 0) { & .\cibuild.cmd /p:NoBuild=true -integrationTest -logFileName IntegrationTest.binlog }
+        if ($runUnitTests        -ne 0) { & dotnet test -c Release --no-restore --nologo --verbosity q --test-adapter-path:. --logger:Appveyor --logger:trx /bl:.\artifacts\log\tests.binlog }
+        #if ($runIntegrationTests -ne 0) { & .\cibuild.cmd /p:NoBuild=true -integrationTest -logFileName IntegrationTest.binlog }
 
         Get-ChildItem -recurse artifacts\tests\TestResult.xml -ErrorAction SilentlyContinue `
         | ForEach-Object {
@@ -135,18 +161,21 @@ test_script:
     }
     if ($testErrorsTotal -ne 0  -and  $failBuildIfTestsFail -ne 0) { $host.SetShouldExit($testErrorsTotal) }
 
-
 # scripts to run after tests
 after_test:
 - ps: |
     Write-Host "Preparing build artifacts..."
-    & .\cibuild.cmd -publish -logFileName publish.binlog
+    dotnet publish -c Release --no-build /bl:.\artifacts\log\publish.binlog /p:ContinuousIntegrationBuild=true
     if ($LastExitCode -ne 0) { $host.SetShouldExit($LastExitCode) }
-
+- ps: |
+    if ([bool]$env:APPVEYOR_PULL_REQUEST_TITLE -and [bool]$env:ARTIFACT_PUBLISH_PULL_REQUEST_MSI) {
+        $msi = (Resolve-Path .\artifacts\Release\publish\GitExtensions-*.msi)[0].Path;
+        Get-ChildItem $msi | % { Push-AppveyorArtifact $_.FullName -FileName $_.Name }
+    }
 
 artifacts:
   - path: artifacts\log\**\*.binlog
-  - path: artifacts\publish\*.zip
+  - path: artifacts\Release\publish\*.zip
 
 #on_finish:
 #  - ps: $blockRdp = $true; iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
@@ -159,3 +188,20 @@ on_failure:
     | ForEach-Object {
         Push-AppveyorArtifact "$_"
     }
+- ps: |
+    Get-ChildItem -recurse English*.xlf -ErrorAction SilentlyContinue `
+    | ForEach-Object {
+        Push-AppveyorArtifact "$_"
+    }
+- ps: |
+    Get-ChildItem -recurse artifacts\Release\TestsResults\*.trx | `
+        ForEach-Object {
+            $file = $_.FullName.Replace('[', '``[').Replace(']', '``]')
+            #Write-Output "Processing $file"
+
+            [xml]$xml = Get-Content -Path $file
+            $xml.TestRun.Results.UnitTestResult | Where-Object outcome -eq 'Failed' | ForEach-Object {
+                $errorMessage = "$($_.Output.ErrorInfo.Message)`r`n$($_.Output.ErrorInfo.StackTrace)`r`n"
+                Write-Host $errorMessage -ForegroundColor Red
+            }
+        }
